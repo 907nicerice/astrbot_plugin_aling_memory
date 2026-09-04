@@ -12,10 +12,55 @@
     "default": true
   },
   "auto_confirm_safe_preferences": {
-    "description": "自动确认高置信偏好记忆",
+    "description": "兼容旧版：自动确认高置信偏好记忆",
     "type": "bool",
     "hint": "默认关闭，建议先人工审核候选。",
     "default": false
+  },
+  "memory_judge_mode": {
+    "description": "长期记忆判断模式",
+    "type": "string",
+    "default": "hybrid",
+    "options": ["rule", "hybrid", "llm"],
+    "hint": "rule 只使用保守规则；hybrid 仅对可能有长期价值的信息调用模型；llm 对所有非寒暄消息调用模型。"
+  },
+  "memory_judge_model": {
+    "description": "记忆判断模型 Provider",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "留空时使用当前会话 Provider；判断失败或超时会自动回退到本地规则。"
+  },
+  "memory_judge_timeout_seconds": {
+    "description": "记忆判断超时（秒）",
+    "type": "float",
+    "default": 8.0
+  },
+  "memory_judge_min_chars": {
+    "description": "触发记忆判断的最短消息长度",
+    "type": "int",
+    "default": 8
+  },
+  "auto_confirm_safe_memories": {
+    "description": "自动保存安全且高置信的长期记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "只自动保存模型判定为 save、低敏感且达到置信度和稳定性阈值的内容。"
+  },
+  "auto_confirm_min_confidence": {
+    "description": "自动保存最低置信度",
+    "type": "float",
+    "default": 0.92
+  },
+  "candidate_reinforce_threshold": {
+    "description": "候选被重复确认多少次后自动巩固",
+    "type": "int",
+    "default": 2
+  },
+  "memory_similarity_threshold": {
+    "description": "候选去重与强化相似度阈值",
+    "type": "float",
+    "default": 0.82
   },
   "context_summary_enabled": {
     "description": "启用短期上下文摘要",

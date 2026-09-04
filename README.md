@@ -10,7 +10,11 @@
 
 - 本地 JSON 持久化记忆，默认按 `unified_msg_origin` 会话隔离。
 - 手动管理记忆：增删改查、标签、废弃。
-- 保守自动候选提取：只在“记住”“我希望”“以后别”等强信号出现时触发。
+- 保守自动候选提取：规则模式关注“记住”“我希望”“以后别”等强信号；混合模式会让模型判断其他可能稳定的信息。
+- 支持 `rule` / `hybrid` / `llm` 三种长期记忆判断模式；默认混合模式，失败时回退本地规则。
+- 记忆候选会去重并累积证据；重复确认达到阈值后可自动巩固为长期记忆。
+- 生命周期字段：重要性、稳定性、敏感等级、明确到期时间、证据次数与最近确认时间。
+- 高敏感信息在本地再次拦截，不写入候选或长期记忆。
 - 短期上下文摘要：默认每 20 轮或手动 `/mem summarize` 生成。
 - recent_trace：保存 24-72h 的轻量话题残影，用来接住“昨天/刚才/继续那个问题”。
 - User Life Mirror：低频整理学习、项目、互动风格、关系质感、记忆偏好。
@@ -71,6 +75,13 @@
 - `enabled`
 - `auto_extract_enabled`
 - `auto_confirm_safe_preferences`
+- `memory_judge_mode`
+- `memory_judge_model`
+- `memory_judge_timeout_seconds`
+- `auto_confirm_safe_memories`
+- `auto_confirm_min_confidence`
+- `candidate_reinforce_threshold`
+- `memory_similarity_threshold`
 - `context_summary_enabled`
 - `mirror_enabled`
 - `debug_enabled`
@@ -117,10 +128,12 @@ data/plugin_data/astrbot_plugin_aling_memory/
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "scopes": {}
 }
 ```
+
+旧版只包含 `ttl_days` 的记忆仍可直接读取。新写入的限时记忆同时保存 `expires_at`；在 Dashboard 修改有效期时从保存时刻重新计算，避免老记忆因修改 TTL 立即过期。
 
 ## 注入策略
 

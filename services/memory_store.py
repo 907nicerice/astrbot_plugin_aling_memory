@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -9,6 +10,7 @@ from ..models.memory_item import (
     CandidateMemory,
     ContextSummary,
     MemoryItem,
+    expires_after_days,
     utc_now_iso,
 )
 from .defaults import DEFAULT_CONFIG, PLUGIN_NAME
@@ -21,7 +23,7 @@ class MemoryStore:
     def __init__(self, data_dir: Path, config: Optional[dict[str, Any]] = None) -> None:
         self.data_dir = data_dir
         self.config = {**DEFAULT_CONFIG, **(config or {})}
-        self.memory_file = JsonFile(data_dir / "memory_store.json", {"version": 1, "scopes": {}})
+        self.memory_file = JsonFile(data_dir / "memory_store.json", {"version": 2, "scopes": {}})
         self.summary_file = JsonFile(data_dir / "context_summaries.json", {"version": 1, "scopes": {}})
         self.config_file = JsonFile(data_dir / "config.json", {"version": 1, **DEFAULT_CONFIG})
 
@@ -33,7 +35,7 @@ class MemoryStore:
 
     def _load_memory_root(self) -> dict[str, Any]:
         data = self.memory_file.load()
-        data.setdefault("version", 1)
+        data["version"] = max(2, int(data.get("version") or 1))
         data.setdefault("scopes", {})
         return data
 
@@ -60,8 +62,14 @@ class MemoryStore:
         use_rule: str = "",
         tone: str = "",
         confidence: float = 0.8,
+        importance: float = 0.5,
+        stability: float = 0.5,
+        sensitivity: str = "low",
         source: str = "manual",
         ttl_days: Optional[int] = None,
+        expires_at: Optional[str] = None,
+        evidence_count: int = 1,
+        supersedes_id: Optional[str] = None,
     ) -> MemoryItem:
         if memory_type not in ALLOWED_MEMORY_TYPES:
             raise ValueError(f"Unsupported memory type: {memory_type}")
@@ -72,8 +80,14 @@ class MemoryStore:
             use_rule=use_rule,
             tone=tone,
             confidence=confidence,
+            importance=importance,
+            stability=stability,
+            sensitivity=sensitivity,
             source=source,
             ttl_days=ttl_days,
+            expires_at=expires_at,
+            evidence_count=evidence_count,
+            supersedes_id=supersedes_id,
         )
         root = self._load_memory_root()
         scope = self._scope(root, scope_id)
@@ -97,6 +111,11 @@ class MemoryStore:
         content: Optional[str] = None,
         tags: Optional[list[str]] = None,
         status: Optional[str] = None,
+        ttl_days: Optional[int] = None,
+        expires_at: Optional[str] = None,
+        importance: Optional[float] = None,
+        stability: Optional[float] = None,
+        sensitivity: Optional[str] = None,
         mark_used: bool = False,
     ) -> Optional[MemoryItem]:
         root = self._load_memory_root()
@@ -112,6 +131,17 @@ class MemoryStore:
                 item.tags = tags
             if status is not None:
                 item.status = status
+            if ttl_days is not None:
+                item.ttl_days = ttl_days or None
+                item.expires_at = expires_after_days(item.ttl_days)
+            if expires_at is not None:
+                item.expires_at = expires_at or None
+            if importance is not None:
+                item.importance = max(0.0, min(1.0, float(importance)))
+            if stability is not None:
+                item.stability = max(0.0, min(1.0, float(stability)))
+            if sensitivity is not None and sensitivity in {"low", "medium", "high"}:
+                item.sensitivity = sensitivity
             if mark_used:
                 item.last_used_at = utc_now_iso()
                 item.used_count += 1
@@ -177,6 +207,95 @@ class MemoryStore:
         self.memory_file.save(root)
         return candidate
 
+    def consolidate_candidate(
+        self,
+        scope_id: str,
+        candidate: CandidateMemory,
+        *,
+        auto_confirm: bool = False,
+    ) -> tuple[str, MemoryItem | CandidateMemory]:
+        """Merge repeated evidence and promote safe, stable candidates."""
+        if candidate.sensitivity == "high":
+            return "rejected_sensitive", candidate
+        root = self._load_memory_root()
+        scope = self._scope(root, scope_id)
+        threshold = float(self.config.get("memory_similarity_threshold") or 0.82)
+
+        for index, raw in enumerate(scope["memories"]):
+            item = MemoryItem.from_dict(raw)
+            if item.status != "active" or item.type != candidate.suggested_type:
+                continue
+            if self._similarity(item.content, candidate.content) < threshold:
+                continue
+            item.evidence_count += 1
+            item.last_confirmed_at = utc_now_iso()
+            item.updated_at = item.last_confirmed_at
+            item.confidence = max(item.confidence, candidate.confidence)
+            item.importance = max(item.importance, candidate.importance)
+            item.stability = max(item.stability, candidate.stability)
+            if candidate.ttl_days:
+                item.ttl_days = max(int(item.ttl_days or 0), int(candidate.ttl_days))
+                item.expires_at = expires_after_days(item.ttl_days)
+            scope["memories"][index] = item.to_dict()
+            self.memory_file.save(root)
+            return "reinforced", item
+
+        matched_index: int | None = None
+        matched: CandidateMemory | None = None
+        for index, raw in enumerate(scope["candidates"]):
+            existing = CandidateMemory.from_dict(raw)
+            if existing.suggested_type != candidate.suggested_type:
+                continue
+            if self._similarity(existing.content, candidate.content) >= threshold:
+                matched_index, matched = index, existing
+                break
+        if matched is not None and matched_index is not None:
+            matched.evidence_count += 1
+            matched.updated_at = utc_now_iso()
+            matched.confidence = max(matched.confidence, candidate.confidence)
+            matched.importance = max(matched.importance, candidate.importance)
+            matched.stability = max(matched.stability, candidate.stability)
+            matched.reason = candidate.reason or matched.reason
+            matched.tags = list(dict.fromkeys([*matched.tags, *candidate.tags]))[:10]
+            candidate = matched
+            scope["candidates"][matched_index] = matched.to_dict()
+
+        reinforce_at = int(self.config.get("candidate_reinforce_threshold") or 2)
+        promote = auto_confirm or (
+            candidate.evidence_count >= reinforce_at
+            and candidate.sensitivity == "low"
+            and candidate.confidence >= 0.8
+            and candidate.stability >= 0.65
+        )
+        if promote:
+            if matched_index is not None:
+                scope["candidates"].pop(matched_index)
+            item = MemoryItem.create(
+                candidate.suggested_type,
+                candidate.content,
+                tags=candidate.tags,
+                use_rule=candidate.use_rule,
+                confidence=candidate.confidence,
+                importance=candidate.importance,
+                stability=candidate.stability,
+                sensitivity=candidate.sensitivity,
+                source="auto_confirmed" if auto_confirm else "auto_consolidated",
+                ttl_days=candidate.ttl_days,
+                evidence_count=candidate.evidence_count,
+            )
+            scope["memories"].append(item.to_dict())
+            max_total = int(self.config.get("max_memory_items_total") or 500)
+            scope["memories"] = scope["memories"][-max_total:]
+            self.memory_file.save(root)
+            return "promoted", item
+
+        if matched_index is None:
+            scope["candidates"].append(candidate.to_dict())
+        max_total = int(self.config.get("max_candidates_total") or 100)
+        scope["candidates"] = scope["candidates"][-max_total:]
+        self.memory_file.save(root)
+        return ("reinforced_candidate" if matched is not None else "candidate"), candidate
+
     def remove_candidate(self, scope_id: str, candidate_id: str) -> Optional[CandidateMemory]:
         root = self._load_memory_root()
         scope = self._scope(root, scope_id)
@@ -203,8 +322,26 @@ class MemoryStore:
             tags=candidate.tags,
             use_rule=candidate.use_rule,
             confidence=candidate.confidence,
+            importance=candidate.importance,
+            stability=candidate.stability,
+            sensitivity=candidate.sensitivity,
             source="auto_confirmed",
+            ttl_days=candidate.ttl_days,
+            evidence_count=candidate.evidence_count,
         )
+
+    @staticmethod
+    def _similarity(left: str, right: str) -> float:
+        def grams(value: str) -> set[str]:
+            clean = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.lower().replace("用户表达过", ""))
+            if len(clean) < 2:
+                return {clean} if clean else set()
+            return {clean[index : index + 2] for index in range(len(clean) - 1)}
+
+        first, second = grams(left), grams(right)
+        if not first or not second:
+            return 0.0
+        return len(first & second) / len(first | second)
 
     def _load_summary_root(self) -> dict[str, Any]:
         data = self.summary_file.load()

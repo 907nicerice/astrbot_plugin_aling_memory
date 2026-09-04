@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -20,6 +20,13 @@ ALLOWED_STATUSES = {"active", "stale", "deprecated"}
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def expires_after_days(days: Optional[int], *, start: Optional[datetime] = None) -> Optional[str]:
+    if not days:
+        return None
+    base = start or datetime.now(timezone.utc)
+    return (base + timedelta(days=int(days))).replace(microsecond=0).isoformat()
 
 
 def parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -44,13 +51,20 @@ class MemoryItem:
     use_rule: str = ""
     tone: str = ""
     confidence: float = 0.7
+    importance: float = 0.5
+    stability: float = 0.5
+    sensitivity: str = "low"
     source: str = "manual"
     status: str = "active"
     ttl_days: Optional[int] = None
+    expires_at: Optional[str] = None
     created_at: str = field(default_factory=utc_now_iso)
     updated_at: str = field(default_factory=utc_now_iso)
+    last_confirmed_at: Optional[str] = None
     last_used_at: Optional[str] = None
     used_count: int = 0
+    evidence_count: int = 1
+    supersedes_id: Optional[str] = None
 
     @classmethod
     def create(
@@ -61,8 +75,14 @@ class MemoryItem:
         use_rule: str = "",
         tone: str = "",
         confidence: float = 0.8,
+        importance: float = 0.5,
+        stability: float = 0.5,
+        sensitivity: str = "low",
         source: str = "manual",
         ttl_days: Optional[int] = None,
+        expires_at: Optional[str] = None,
+        evidence_count: int = 1,
+        supersedes_id: Optional[str] = None,
     ) -> "MemoryItem":
         if memory_type not in ALLOWED_MEMORY_TYPES:
             raise ValueError(f"Unsupported memory type: {memory_type}")
@@ -75,10 +95,17 @@ class MemoryItem:
             use_rule=use_rule.strip(),
             tone=tone.strip(),
             confidence=max(0.0, min(1.0, confidence)),
+            importance=max(0.0, min(1.0, importance)),
+            stability=max(0.0, min(1.0, stability)),
+            sensitivity=sensitivity if sensitivity in {"low", "medium", "high"} else "low",
             source=source,
             ttl_days=ttl_days,
+            expires_at=expires_at or expires_after_days(ttl_days, start=datetime.fromisoformat(now)),
             created_at=now,
             updated_at=now,
+            last_confirmed_at=now,
+            evidence_count=max(1, int(evidence_count)),
+            supersedes_id=supersedes_id,
         )
 
     @classmethod
@@ -91,19 +118,30 @@ class MemoryItem:
             use_rule=str(data.get("use_rule") or ""),
             tone=str(data.get("tone") or ""),
             confidence=float(data.get("confidence", 0.7)),
+            importance=float(data.get("importance", 0.5)),
+            stability=float(data.get("stability", 0.5)),
+            sensitivity=str(data.get("sensitivity") or "low"),
             source=str(data.get("source") or "manual"),
             status=str(data.get("status") or "active"),
             ttl_days=data.get("ttl_days"),
+            expires_at=data.get("expires_at"),
             created_at=str(data.get("created_at") or utc_now_iso()),
             updated_at=str(data.get("updated_at") or utc_now_iso()),
+            last_confirmed_at=data.get("last_confirmed_at"),
             last_used_at=data.get("last_used_at"),
             used_count=int(data.get("used_count") or 0),
+            evidence_count=max(1, int(data.get("evidence_count") or 1)),
+            supersedes_id=data.get("supersedes_id"),
         )
         if item.type not in ALLOWED_MEMORY_TYPES:
             item.type = "small_memory"
         if item.status not in ALLOWED_STATUSES:
             item.status = "active"
         item.confidence = max(0.0, min(1.0, item.confidence))
+        item.importance = max(0.0, min(1.0, item.importance))
+        item.stability = max(0.0, min(1.0, item.stability))
+        if item.sensitivity not in {"low", "medium", "high"}:
+            item.sensitivity = "low"
         item.tags = [str(tag).strip() for tag in item.tags if str(tag).strip()]
         return item
 
@@ -111,12 +149,15 @@ class MemoryItem:
         return asdict(self)
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
+        ref = now or datetime.now(timezone.utc)
+        explicit = parse_iso(self.expires_at)
+        if explicit:
+            return ref >= explicit
         if not self.ttl_days:
             return False
         created = parse_iso(self.created_at)
         if not created:
             return False
-        ref = now or datetime.now(timezone.utc)
         return (ref - created).days >= self.ttl_days
 
 
@@ -127,9 +168,16 @@ class CandidateMemory:
     content: str
     reason: str
     confidence: float = 0.7
+    importance: float = 0.5
+    stability: float = 0.5
+    sensitivity: str = "low"
+    decision: str = "candidate"
+    ttl_days: Optional[int] = None
     tags: list[str] = field(default_factory=list)
     use_rule: str = ""
     created_at: str = field(default_factory=utc_now_iso)
+    updated_at: str = field(default_factory=utc_now_iso)
+    evidence_count: int = 1
 
     @classmethod
     def create(
@@ -138,6 +186,11 @@ class CandidateMemory:
         content: str,
         reason: str,
         confidence: float,
+        importance: float = 0.5,
+        stability: float = 0.5,
+        sensitivity: str = "low",
+        decision: str = "candidate",
+        ttl_days: Optional[int] = None,
         tags: Optional[list[str]] = None,
         use_rule: str = "",
     ) -> "CandidateMemory":
@@ -149,6 +202,11 @@ class CandidateMemory:
             content=content.strip(),
             reason=reason.strip(),
             confidence=max(0.0, min(1.0, confidence)),
+            importance=max(0.0, min(1.0, importance)),
+            stability=max(0.0, min(1.0, stability)),
+            sensitivity=sensitivity if sensitivity in {"low", "medium", "high"} else "low",
+            decision=decision if decision in {"save", "candidate", "ignore"} else "candidate",
+            ttl_days=ttl_days,
             tags=tags or [],
             use_rule=use_rule.strip(),
         )
@@ -161,9 +219,16 @@ class CandidateMemory:
             content=str(data.get("content") or ""),
             reason=str(data.get("reason") or ""),
             confidence=float(data.get("confidence", 0.7)),
+            importance=float(data.get("importance", 0.5)),
+            stability=float(data.get("stability", 0.5)),
+            sensitivity=str(data.get("sensitivity") or "low"),
+            decision=str(data.get("decision") or "candidate"),
+            ttl_days=data.get("ttl_days"),
             tags=list(data.get("tags") or []),
             use_rule=str(data.get("use_rule") or ""),
             created_at=str(data.get("created_at") or utc_now_iso()),
+            updated_at=str(data.get("updated_at") or data.get("created_at") or utc_now_iso()),
+            evidence_count=max(1, int(data.get("evidence_count") or 1)),
         )
 
     def to_dict(self) -> dict[str, Any]:

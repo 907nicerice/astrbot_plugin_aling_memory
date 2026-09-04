@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, AsyncGenerator
@@ -58,6 +59,7 @@ from .services.flashback import FlashbackService
 from .services.injector import Injector
 from .services.json_store import resolve_data_dir
 from .services.memory_store import MemoryStore
+from .services.memory_judge import MemoryJudge, SYSTEM_PROMPT as MEMORY_JUDGE_SYSTEM_PROMPT
 from .services.mirror_service import MirrorService
 from .services.provider_compat import extract_response_text, extract_user_text, inject_text, scope_from_event
 from .services.recent_trace_service import RecentTraceService
@@ -73,7 +75,7 @@ logger = logging.getLogger(PLUGIN_NAME)
     "astrbot_plugin_aling_memory",
     "Codex",
     "阿绫长期小记忆 / User Life Mirror / 上下文压缩插件",
-    "0.1.0",
+    "0.2.0",
 )
 class AlingMemoryPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
@@ -90,6 +92,7 @@ class AlingMemoryPlugin(Star):
         self.mirror = MirrorService(self.data_dir, self.config)
         self.summarizer = Summarizer(self.config)
         self.extractor = Extractor(self.config)
+        self.memory_judge = MemoryJudge(self.config)
         self.recent_trace = RecentTraceService(self.data_dir, self.config)
 
     @filter.command("mem")
@@ -117,7 +120,7 @@ class AlingMemoryPlugin(Star):
             scene = self.router.classify(user_text)
             if scene.primary_scene == "command":
                 return
-            self._maybe_extract_user_candidate(scope_id, user_text)
+            await self._maybe_extract_user_candidate(scope_id, user_text, event)
             self._maybe_periodic_summary(scope_id, turn)
             retrieval = self.retriever.retrieve(scope_id, user_text, scene)
             mirror_limit = self.injector.mirror_limit(scene.primary_scene)
@@ -242,6 +245,8 @@ class AlingMemoryPlugin(Star):
         return (
             f"id: {item.id}\n"
             f"type: {item.type}\nstatus: {item.status}\nsource: {item.source}\nconfidence: {item.confidence}\n"
+            f"importance: {item.importance}\nstability: {item.stability}\nsensitivity: {item.sensitivity}\n"
+            f"expires_at: {item.expires_at or '-'}\nevidence_count: {item.evidence_count}\n"
             f"tags: {', '.join(item.tags) or '-'}\ncontent: {item.content}\nuse_rule: {item.use_rule or '-'}"
         )
 
@@ -282,7 +287,8 @@ class AlingMemoryPlugin(Star):
         if not candidates:
             return "当前没有候选记忆。"
         return "\n".join(
-            f"{cand.id} [{cand.suggested_type}/{cand.confidence:.2f}] {cand.content}\n原因：{cand.reason}"
+            f"{cand.id} [{cand.suggested_type}/{cand.confidence:.2f}] {cand.content}\n"
+            f"重要性：{cand.importance:.2f} 稳定性：{cand.stability:.2f} 证据：{cand.evidence_count}\n原因：{cand.reason}"
             for cand in candidates[:20]
         )
 
@@ -350,28 +356,70 @@ class AlingMemoryPlugin(Star):
             f"injection:\n{plan.text or '(empty)'}"
         )
 
-    def _maybe_extract_user_candidate(self, scope_id: str, text: str) -> None:
+    async def _maybe_extract_user_candidate(self, scope_id: str, text: str, event: AstrMessageEvent) -> None:
         if not self.config.get("auto_extract_enabled", True):
             return
-        for candidate in self.extractor.extract_from_user_text(text):
-            if self.extractor.auto_confirmable(candidate):
-                item = self.store.add_memory(
-                    scope_id,
-                    candidate.suggested_type,
-                    candidate.content,
-                    tags=candidate.tags,
-                    use_rule=candidate.use_rule,
-                    confidence=candidate.confidence,
-                    source="auto_confirmed",
+        candidates = self.extractor.extract_from_user_text(text)
+        if self.extractor.eligible_for_llm(text) and self.memory_judge.should_call(text, bool(candidates)):
+            try:
+                timeout = max(1.0, float(self.config.get("memory_judge_timeout_seconds") or 8))
+                response_text = await asyncio.wait_for(
+                    self._call_memory_judge(event, self.memory_judge.build_prompt(text, self.store.recent_messages(scope_id))),
+                    timeout=timeout,
                 )
-                logger.info(
-                    "[aling_memory] auto_confirm memory id=%s type=%s confidence=%.2f",
-                    item.id,
-                    item.type,
-                    item.confidence,
-                )
-            else:
-                self.store.add_candidate(scope_id, candidate)
+                judged = self.memory_judge.parse(response_text)
+                if judged:
+                    candidates = judged
+            except Exception as exc:
+                logger.warning("[aling_memory] memory judge fallback to rules: %s", type(exc).__name__)
+
+        for candidate in candidates:
+            outcome, stored = self.store.consolidate_candidate(
+                scope_id,
+                candidate,
+                auto_confirm=self.extractor.auto_confirmable(candidate),
+            )
+            logger.info(
+                "[aling_memory] candidate outcome=%s id=%s type=%s confidence=%.2f evidence=%s",
+                outcome,
+                stored.id,
+                getattr(stored, "type", getattr(stored, "suggested_type", "unknown")),
+                stored.confidence,
+                stored.evidence_count,
+            )
+
+    async def _call_memory_judge(self, event: AstrMessageEvent, prompt: str) -> str:
+        provider_id = str(self.config.get("memory_judge_model") or "").strip()
+        if not provider_id:
+            getter = getattr(self.context, "get_current_chat_provider_id", None)
+            if callable(getter):
+                try:
+                    provider_id = await getter(umo=event.unified_msg_origin)
+                except TypeError:
+                    provider_id = await getter(event.unified_msg_origin)
+        llm_generate = getattr(self.context, "llm_generate", None)
+        if callable(llm_generate) and provider_id:
+            response = await llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=MEMORY_JUDGE_SYSTEM_PROMPT,
+            )
+            return self._completion_text(response)
+        get_provider = getattr(self.context, "get_using_provider", None)
+        provider = get_provider(event.unified_msg_origin) if callable(get_provider) else None
+        if provider is None:
+            raise RuntimeError("no memory judge provider is available")
+        response = await provider.text_chat(prompt=prompt, system_prompt=MEMORY_JUDGE_SYSTEM_PROMPT)
+        return self._completion_text(response)
+
+    @staticmethod
+    def _completion_text(response: Any) -> str:
+        text = getattr(response, "completion_text", None)
+        if text is None and isinstance(response, str):
+            text = response
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("empty memory judge response")
+        return text.strip()
 
     def _maybe_periodic_summary(self, scope_id: str, turn: int) -> None:
         if not self.config.get("context_summary_enabled", True):
@@ -388,7 +436,7 @@ class AlingMemoryPlugin(Star):
         if not self.config.get("auto_extract_enabled", True):
             return
         for candidate in self.extractor.extract_from_summary(text):
-            self.store.add_candidate(scope_id, candidate)
+            self.store.consolidate_candidate(scope_id, candidate)
 
     def _merge_config(self, config: Any) -> dict[str, Any]:
         merged = dict(DEFAULT_CONFIG)

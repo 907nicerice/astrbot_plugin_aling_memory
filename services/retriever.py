@@ -89,13 +89,15 @@ class Retriever:
             return False, "inactive"
         if item.is_expired():
             return False, "expired"
+        if item.sensitivity == "high":
+            return False, "high_sensitivity"
         if item.type == "project_context" and scene != "project_discussion":
             return False, "project_context_scene_mismatch"
         return True, "ok"
 
     def _score(self, item: MemoryItem, text: str, scene: SceneResult) -> float:
         lower = text.lower()
-        score = item.confidence
+        score = item.confidence + item.importance * 0.35 + item.stability * 0.2
         if item.source == "manual":
             score += 0.25
         if item.updated_at:
@@ -103,6 +105,8 @@ class Retriever:
             if updated:
                 age_days = max(0, (datetime.now(timezone.utc) - updated).days)
                 score += max(0, 0.2 - age_days * 0.01)
+                if item.stability < 0.5:
+                    score -= min(0.4, age_days * 0.02)
         haystack = f"{item.content} {' '.join(item.tags)} {item.use_rule}".lower()
         hits = 0
         for tag in item.tags:
