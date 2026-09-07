@@ -5,6 +5,12 @@
     "hint": "关闭后不再注入记忆，也不自动提取候选。",
     "default": true
   },
+  "test_account_ids": {
+    "description": "测试账号 QQ 号",
+    "type": "string",
+    "default": "",
+    "hint": "多个 QQ 号用逗号分隔。测试账号使用独立的长期记忆、候选、摘要、recent_trace 和 User Life Mirror；正式账号现有数据不变。建议测试账号仅私聊阿绫。"
+  },
   "auto_extract_enabled": {
     "description": "启用保守自动候选提取",
     "type": "bool",

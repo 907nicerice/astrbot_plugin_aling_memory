@@ -75,7 +75,7 @@ logger = logging.getLogger(PLUGIN_NAME)
     "astrbot_plugin_aling_memory",
     "Codex",
     "阿绫长期小记忆 / User Life Mirror / 上下文压缩插件",
-    "0.2.0",
+    "0.2.1",
 )
 class AlingMemoryPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
@@ -99,7 +99,7 @@ class AlingMemoryPlugin(Star):
     async def mem(self, event: AstrMessageEvent) -> AsyncGenerator[Any, None]:
         try:
             raw = getattr(event, "message_str", "") or extract_user_text(event=event)
-            scope_id = scope_from_event(event)
+            scope_id = self._scope_id(event)
             reply = self._handle_command(scope_id, raw)
         except Exception:
             logger.exception("[aling_memory] command failed")
@@ -111,7 +111,7 @@ class AlingMemoryPlugin(Star):
         try:
             if not self.config.get("enabled", True):
                 return
-            scope_id = scope_from_event(event)
+            scope_id = self._scope_id(event)
             user_text = extract_user_text(event=event, req=req)
             if not user_text:
                 return
@@ -154,7 +154,7 @@ class AlingMemoryPlugin(Star):
         try:
             if not self.config.get("enabled", True):
                 return
-            scope_id = scope_from_event(event)
+            scope_id = self._scope_id(event)
             text = extract_response_text(resp)
             if text:
                 self.store.record_message(scope_id, "assistant", text)
@@ -162,6 +162,9 @@ class AlingMemoryPlugin(Star):
                 self.recent_trace.save_from_turn(scope_id, user_text, text)
         except Exception:
             logger.warning("[aling_memory] on_llm_response failed", exc_info=True)
+
+    def _scope_id(self, event: AstrMessageEvent) -> str:
+        return scope_from_event(event, self.config.get("test_account_ids"))
 
     def _handle_command(self, scope_id: str, raw: str) -> str:
         text = raw.strip()

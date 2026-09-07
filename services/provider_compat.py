@@ -86,15 +86,50 @@ def extract_response_text(resp: Any) -> str:
     return ""
 
 
-def scope_from_event(event: Any) -> str:
+def scope_from_event(event: Any, test_account_ids: Any = None) -> str:
     value = _safe_get(event, "unified_msg_origin")
     if value:
-        return str(value)
-    for name in ("session_id", "group_id", "user_id"):
+        scope = str(value)
+    else:
+        scope = "default"
+        for name in ("session_id", "group_id", "user_id"):
+            value = _safe_get(event, name)
+            if value:
+                scope = str(value)
+                break
+    sender_id = sender_id_from_event(event)
+    if sender_id and sender_id in normalize_id_set(test_account_ids):
+        return f"test-account:{sender_id}:{scope}"
+    return scope
+
+
+def sender_id_from_event(event: Any) -> str:
+    for method_name in ("get_sender_id", "get_user_id"):
+        method = _safe_get(event, method_name)
+        if callable(method):
+            try:
+                value = method()
+            except Exception:
+                value = None
+            if value:
+                return str(value).strip()
+    for name in ("user_id", "sender_id"):
         value = _safe_get(event, name)
         if value:
-            return str(value)
-    return "default"
+            return str(value).strip()
+    return ""
+
+
+def normalize_id_set(value: Any) -> set[str]:
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        chunks = value.replace("，", ",").replace("\n", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        chunks = value
+    else:
+        chunks = [value]
+    return {str(item).strip() for item in chunks if str(item).strip()}
 
 
 def _make_text_part(text: str) -> Any:

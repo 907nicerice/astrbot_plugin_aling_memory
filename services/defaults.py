@@ -5,6 +5,7 @@ PLUGIN_NAME = "astrbot_plugin_aling_memory"
 
 DEFAULT_CONFIG = {
     "enabled": True,
+    "test_account_ids": "",
     "auto_extract_enabled": True,
     "auto_confirm_safe_preferences": False,
     "memory_judge_mode": "hybrid",
